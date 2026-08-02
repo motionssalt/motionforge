@@ -1,0 +1,50 @@
+# ============================================================
+# MotionForge — one-time D1 bootstrap
+# ------------------------------------------------------------
+# Run this ONCE, manually, from the Actions tab.
+# It creates the D1 database in your Cloudflare account and
+# prints the `database_id` to the job summary. Copy that id
+# into worker/wrangler.toml (the database_id line) and commit.
+# After that, deploy.yml runs automatically on push to main.
+# ============================================================
+name: bootstrap-d1
+on:
+  workflow_dispatch: {}
+
+jobs:
+  create-db:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install wrangler
+        run: npm i -g wrangler@3
+      - name: Create D1 database (idempotent-ish)
+        env:
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          echo "Creating D1 database 'motionforge' (or reusing existing)..."
+          # `wrangler d1 create` errors if it already exists — swallow that
+          # and fall back to `wrangler d1 list` to fetch the existing id.
+          if ! wrangler d1 create motionforge 2>&1 | tee create.log; then
+            echo "Create failed (already exists?) — listing databases:"
+            wrangler d1 list --json > list.json
+            cat list.json
+            DB_ID=$(node -e "const j=require('./list.json');const r=j.find(x=>x.name==='motionforge');if(!r){console.error('not found');process.exit(1)}console.log(r.uuid||r.id)")
+          else
+            DB_ID=$(grep -oE '[0-9a-f-]{36}' create.log | head -1)
+          fi
+          echo "DB_ID=$DB_ID"
+          echo "### D1 database created" >> "$GITHUB_STEP_SUMMARY"
+          echo '```toml' >> "$GITHUB_STEP_SUMMARY"
+          echo '[[d1_databases]]' >> "$GITHUB_STEP_SUMMARY"
+          echo 'binding       = "DB"' >> "$GITHUB_STEP_SUMMARY"
+          echo 'database_name = "motionforge"' >> "$GITHUB_STEP_SUMMARY"
+          echo "database_id   = \"$DB_ID\"" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Copy the \`database_id\` line into **worker/wrangler.toml** and commit." >> "$GITHUB_STEP_SUMMARY"
