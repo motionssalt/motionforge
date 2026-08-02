@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+render.log
+spec.json
+output.mp4
+tg-response.json
+create.log
+list.json
+.DS_Store
