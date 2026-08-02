@@ -8,7 +8,9 @@
    ============================================================ */
 
 import { validate } from "./validate.js";
-import { buildTemplate, STYLES } from "./template.js";
+import {
+  buildTemplate, STYLES, STYLE_CATEGORIES, flavorsFor, DENSITIES,
+} from "./template.js";
 
 const TG_API = (token, method) => `https://api.telegram.org/bot${token}/${method}`;
 
@@ -26,7 +28,6 @@ async function tg(env, method, body) {
 }
 
 const RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
-const DURATIONS = [5, 8, 12, 20];
 
 async function getSession(env, chatId) {
   const row = await env.DB.prepare("SELECT * FROM sessions WHERE chat_id = ?")
@@ -37,18 +38,22 @@ async function setSession(env, chatId, patch) {
   const now = Math.floor(Date.now() / 1000);
   const existing = await getSession(env, chatId);
   const merged = Object.assign({
-    chat_id: String(chatId), step: "idle", ratio: null, duration: null, style: null,
+    chat_id: String(chatId), step: "idle", ratio: null, density: null,
+    style_category: null, style: null,
     created_at: now,
   }, existing || {}, patch, { updated_at: now });
   await env.DB.prepare(
-    `INSERT INTO sessions (chat_id, step, ratio, duration, style, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO sessions
+       (chat_id, step, ratio, density, style_category, style, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chat_id) DO UPDATE SET
-       step=excluded.step, ratio=excluded.ratio, duration=excluded.duration,
-       style=excluded.style, updated_at=excluded.updated_at`
+       step=excluded.step, ratio=excluded.ratio, density=excluded.density,
+       style_category=excluded.style_category, style=excluded.style,
+       updated_at=excluded.updated_at`
   ).bind(
-    merged.chat_id, merged.step, merged.ratio,
-    merged.duration, merged.style, merged.created_at, merged.updated_at
+    merged.chat_id, merged.step, merged.ratio, merged.density,
+    merged.style_category, merged.style,
+    merged.created_at, merged.updated_at
   ).run();
   return merged;
 }
@@ -63,12 +68,49 @@ const kbRatio = () => ({
     RATIOS.slice(3).map(r => ({ text: r, callback_data: "ratio:" + r })),
   ],
 });
-const kbDuration = () => ({
-  inline_keyboard: [DURATIONS.map(d => ({ text: `${d}s`, callback_data: "dur:" + d }))],
+const kbDensity = () => ({
+  inline_keyboard: [
+    DENSITIES.map(d => ({ text: d.label, callback_data: "density:" + d.key })),
+  ],
 });
-const kbStyle = () => ({
-  inline_keyboard: STYLES.map(s => [{ text: s.label, callback_data: "style:" + s.key }]),
+const kbStyleCategory = () => ({
+  inline_keyboard: STYLE_CATEGORIES.map(c => [
+    { text: c.label, callback_data: "cat:" + c.key },
+  ]),
 });
+const kbStyleFlavor = (categoryKey) => ({
+  inline_keyboard: flavorsFor(categoryKey).map(s => [
+    { text: s.label, callback_data: "style:" + s.key },
+  ]),
+});
+
+const DENSITY_PROMPT =
+  "How much content? (this shapes the brief, not a fixed length)\n\n" +
+  DENSITIES.map(d => `• *${d.label}* — ${d.hint}`).join("\n");
+
+async function proceedToTemplate(env, chatId, style) {
+  const s = STYLES.find(x => x.key === style);
+  if (!s) return;
+  const sess = await setSession(env, chatId, { step: "await_spec", style });
+  const tmpl = buildTemplate({
+    ratio: sess.ratio,
+    style,
+    density: sess.density,
+  });
+  const json = JSON.stringify(tmpl, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+  fd.append("caption",
+    `Style: *${s.label}* ✓\n\nTake this template + the creative brief inside \`meta.prompt\` ` +
+    `to any AI (ChatGPT/Claude/Gemini). Ask it to fill in the *scenes* array. ` +
+    `Send the completed JSON back here as a \`.json\` file attachment.\n\n` +
+    `You can also attach a voiceover or reference audio in your prompt to that AI ` +
+    `— MotionForge itself doesn't need audio, it just renders the JSON.`);
+  fd.append("parse_mode", "Markdown");
+  fd.append("document", blob, "motionforge-template.json");
+  await fetch(TG_API(env.TELEGRAM_BOT_TOKEN, "sendDocument"), { method: "POST", body: fd });
+}
 
 /* ---------- main webhook handler ---------- */
 export async function handleTelegramUpdate(env, update, deps) {
@@ -84,47 +126,56 @@ export async function handleTelegramUpdate(env, update, deps) {
     if (data.startsWith("ratio:")) {
       const r = data.slice(6);
       if (!RATIOS.includes(r)) return;
-      await setSession(env, chatId, { step: "await_duration", ratio: r });
+      await setSession(env, chatId, { step: "await_density", ratio: r });
       return tg(env, "sendMessage", {
         chat_id: chatId,
-        text: `Ratio: *${r}* ✓\n\nDuration (seconds):`,
+        text: `Ratio: *${r}* ✓\n\n${DENSITY_PROMPT}`,
         parse_mode: "Markdown",
-        reply_markup: kbDuration(),
+        reply_markup: kbDensity(),
       });
     }
-    if (data.startsWith("dur:")) {
-      const d = parseInt(data.slice(4), 10);
-      if (!Number.isFinite(d) || d <= 0 || d > 120) return;
-      await setSession(env, chatId, { step: "await_style", duration: d });
+    if (data.startsWith("density:")) {
+      const key = data.slice(8);
+      const d = DENSITIES.find(x => x.key === key);
+      if (!d) return;
+      await setSession(env, chatId, { step: "await_style_category", density: key });
       return tg(env, "sendMessage", {
         chat_id: chatId,
-        text: `Duration: *${d}s* ✓\n\nPick a style — this is just a starting flavor, the AI is free within the whole preset library:`,
+        text:
+          `Density: *${d.label}* ✓\n\n` +
+          `Pick a style category — this is just a starting flavor, the AI is free within ` +
+          `the whole preset library:`,
         parse_mode: "Markdown",
-        reply_markup: kbStyle(),
+        reply_markup: kbStyleCategory(),
+      });
+    }
+    if (data.startsWith("cat:")) {
+      const key = data.slice(4);
+      const cat = STYLE_CATEGORIES.find(c => c.key === key);
+      if (!cat) return;
+      const flavors = flavorsFor(key);
+      if (flavors.length === 0) return;
+      // If a category has only one flavor, skip the flavor sub-step.
+      if (flavors.length === 1) {
+        await setSession(env, chatId, { step: "await_spec", style_category: key });
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: `Category: *${cat.label}* ✓`,
+          parse_mode: "Markdown",
+        });
+        return proceedToTemplate(env, chatId, flavors[0].key);
+      }
+      await setSession(env, chatId, { step: "await_style", style_category: key });
+      return tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: `Category: *${cat.label}* ✓\n\nPick a flavor:`,
+        parse_mode: "Markdown",
+        reply_markup: kbStyleFlavor(key),
       });
     }
     if (data.startsWith("style:")) {
       const key = data.slice(6);
-      const s = STYLES.find(x => x.key === key);
-      if (!s) return;
-      const sess = await setSession(env, chatId, { step: "await_spec", style: key });
-      const tmpl = buildTemplate({ ratio: sess.ratio, duration: sess.duration, style: key });
-      // Send template as a document — Telegram truncates long messages,
-      // and 5+KB of JSON as text is unreadable anyway.
-      const json = JSON.stringify(tmpl, null, 2);
-      const blob = new Blob([json], { type: "application/json" });
-      const fd = new FormData();
-      fd.append("chat_id", String(chatId));
-      fd.append("caption",
-        `Style: *${s.label}* ✓\n\nTake this template + the creative brief inside \`meta.prompt\` ` +
-        `to any AI (ChatGPT/Claude/Gemini). Ask it to fill in the *scenes* array. ` +
-        `Send the completed JSON back here — as a file or pasted text.\n\n` +
-        `You can also attach a voiceover or reference audio in your prompt to that AI ` +
-        `— MotionForge itself doesn't need audio, it just renders the JSON.`);
-      fd.append("parse_mode", "Markdown");
-      fd.append("document", blob, "motionforge-template.json");
-      await fetch(TG_API(env.TELEGRAM_BOT_TOKEN, "sendDocument"), { method: "POST", body: fd });
-      return;
+      return proceedToTemplate(env, chatId, key);
     }
     return;
   }
@@ -139,10 +190,15 @@ export async function handleTelegramUpdate(env, update, deps) {
 
   /* --- commands --- */
   if (text === "/start" || text === "/new" || text === "/help") {
-    await setSession(env, chatId, { step: "await_ratio", ratio: null, duration: null, style: null });
+    await setSession(env, chatId, {
+      step: "await_ratio",
+      ratio: null, density: null, style_category: null, style: null,
+    });
     const help = text === "/help"
       ? "MotionForge — turn a Motion JSON Studio spec into an MP4 via Telegram.\n\n" +
-        "Flow:\n1. /new → pick ratio, duration, style\n2. Get a JSON template\n3. Fill it (with any AI)\n4. Send it back → I render + return the MP4\n\n" +
+        "Flow:\n1. /new → pick ratio, content density, style (category → flavor)\n" +
+        "2. Get a JSON template\n3. Fill it (with any AI)\n" +
+        "4. Send it back as a .json file → I render + return the MP4\n\n" +
         "Commands: /new /status /cancel /help\n"
       : "👋 MotionForge. I turn a Motion JSON Studio spec into an MP4.\n\nPick an aspect ratio:";
     return tg(env, "sendMessage", {
@@ -163,9 +219,8 @@ export async function handleTelegramUpdate(env, update, deps) {
     return tg(env, "sendMessage", { chat_id: chatId, text: line, parse_mode: "Markdown" });
   }
 
-  /* --- incoming spec (as document or pasted text) --- */
+  /* --- incoming spec (as .json document only) --- */
   const sess = await getSession(env, chatId);
-  const looksLikeJson = text.startsWith("{") && text.endsWith("}");
   let specText = null;
 
   if (msg.document) {
@@ -184,8 +239,6 @@ export async function handleTelegramUpdate(env, update, deps) {
     } catch (err) {
       return tg(env, "sendMessage", { chat_id: chatId, text: "Could not download that file: " + (err.message || err) });
     }
-  } else if (looksLikeJson) {
-    specText = text;
   }
 
   if (specText) {
@@ -198,12 +251,23 @@ export async function handleTelegramUpdate(env, update, deps) {
   }
   if (sess.step === "await_ratio")
     return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a ratio:", reply_markup: kbRatio() });
-  if (sess.step === "await_duration")
-    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a duration:", reply_markup: kbDuration() });
+  if (sess.step === "await_density")
+    return tg(env, "sendMessage", {
+      chat_id: chatId, text: DENSITY_PROMPT, parse_mode: "Markdown", reply_markup: kbDensity(),
+    });
+  if (sess.step === "await_style_category")
+    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a style category:", reply_markup: kbStyleCategory() });
   if (sess.step === "await_style")
-    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a style:", reply_markup: kbStyle() });
+    return tg(env, "sendMessage", {
+      chat_id: chatId, text: "Pick a flavor:",
+      reply_markup: kbStyleFlavor(sess.style_category),
+    });
   if (sess.step === "await_spec")
-    return tg(env, "sendMessage", { chat_id: chatId, text: "Send me the completed JSON — as a .json file or pasted text." });
+    return tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "Please send the completed spec as a `.json` file attachment — pasted JSON text is no longer accepted.",
+      parse_mode: "Markdown",
+    });
 }
 
 /* ---------- validate + queue a job ---------- */
