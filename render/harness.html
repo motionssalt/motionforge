@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>MotionForge render harness</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&family=Archivo+Black&family=Baloo+2:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,400;0,500;0,700;0,900;1,400;1,500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* ------------------------------------------------------------
+     Minimal engine-scoped CSS (adapted from test-frames.html —
+     only the rules the engine actually needs to render into #stage).
+     ------------------------------------------------------------ */
+  html,body{margin:0;padding:0;background:#000;overflow:hidden}
+  body{font-family:"Space Grotesk",system-ui,sans-serif;color:#fff}
+  #stage{
+    position:relative;overflow:hidden;background:#000;
+    aspect-ratio:var(--ar,1.778);
+    width:100vw;height:100vh;   /* will be overridden by JS to exact WxH */
+  }
+  #stage .scene{position:absolute;inset:0;overflow:hidden;display:none}
+  #stage .cam{position:absolute;inset:0;transform-origin:50% 50%}
+  #stage .bg-layer{position:absolute;inset:-12%}
+  #stage .noise{position:absolute;inset:0}
+  #stage .el{position:absolute;transform:translate(-50%,-50%);
+             white-space:nowrap;line-height:1.15;transform-style:preserve-3d}
+  #stage .el .ch{display:inline-block}
+  #stage .el-text{font-weight:800}
+  #stage .el-caption{font-weight:600;text-align:center;white-space:pre-wrap}
+  #stage .avatar{border-radius:50%;overflow:hidden}
+  #stage .av-head,#stage .av-body{position:absolute;left:50%;transform:translateX(-50%)}
+  #stage .av-head{width:34%;height:34%;border-radius:50%;top:18%}
+  #stage .av-body{width:66%;height:48%;border-radius:50% 50% 0 0;top:58%}
+  #stage .el-card,#stage .el-device,#stage .el-clip{overflow:hidden}
+  #stage .stage-flash{position:absolute;inset:0;background:#fff;opacity:0}
+</style>
+</head><body>
+<div id="stage"></div>
+<script src="../js/engine.js"></script>
+<script src="../js/validate.js"></script>
+<script>
+  // The Puppeteer driver injects `window.__SPEC__` via addScriptTag BEFORE
+  // calling window.__forgeBuild() / __forgeDraw(). Everything below is a
+  // thin bridge over the existing engine — no re-implementation.
+  window.__forgeReady = true;
+
+  window.__forgeBuild = function () {
+    const spec = window.__SPEC__;
+    if (!spec) throw new Error("no __SPEC__ on window");
+    const v = window.MG.validate(spec);
+    if (v.errors.length) throw new Error("VALIDATE:" + JSON.stringify(v.errors));
+
+    const meta = spec.meta || {};
+    let W = (typeof meta.width === "number" && meta.width  > 0) ? meta.width  : 0;
+    let H = (typeof meta.height=== "number" && meta.height > 0) ? meta.height : 0;
+    if (!(W > 0 && H > 0)) {
+      const R = window.MG.Engine.RATIOS[meta.ratio] || window.MG.Engine.RATIOS["16:9"];
+      W = R[0]; H = R[1];
+    }
+    const stage = document.getElementById("stage");
+    stage.style.width  = W + "px";
+    stage.style.height = H + "px";
+    stage.style.setProperty("--u", (W / 1000) + "px");
+    // build composition
+    window.__forgeComp = window.MG.Engine.build(spec, stage);
+    // re-set --u after build (build() clears innerHTML)
+    stage.style.setProperty("--u", (W / 1000) + "px");
+    return { W: W, H: H, duration: window.__forgeComp.duration,
+             warnings: v.warnings, stats: v.stats };
+  };
+
+  window.__forgeDraw = function (t) {
+    window.MG.Engine.draw(window.__forgeComp, t);
+  };
+</script>
+</body></html>
