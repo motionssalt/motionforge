@@ -1,0 +1,465 @@
+ README.md              |  17 ++---
+ worker/src/telegram.js | 168 ++++++++++++++++++++++++++++++++++---------------
+ worker/src/template.js |  92 +++++++++++++++++++--------
+ worker/src/validate.js |   9 ++-
+ 4 files changed, 199 insertions(+), 87 deletions(-)
+diff --git a/README.md b/README.md
+index 64cf98b..7eaeeec 100644
+--- a/README.md
++++ b/README.md
+@@ -46,7 +46,8 @@ No R2, no S3, no external storage. The MP4 exists only on the ephemeral runner a
+ │   ├── wrangler.toml
+ │   └── package.json
+ ├── migrations/
+-│   └── 0001_init.sql         # jobs + sessions tables
++│   ├── 0001_init.sql         # jobs + sessions tables
++│   └── 0002_sessions_density.sql  # sessions: duration → density + style_category
+ └── .github/workflows/
+     ├── bootstrap.yml         # one-time D1 create (workflow_dispatch)
+     ├── deploy.yml            # push-to-main → migrate + deploy
+@@ -171,12 +172,14 @@ You never run `wrangler` yourself.
+ ## End-to-end test
+ 
+ 1. In Telegram, open your bot → `/start`.
+-2. Pick a ratio (`16:9`), a duration (`8s`), a style (`Editorial / typographic`).
+-3. The bot sends you `motionforge-template.json`. Open it — `meta.prompt` is a creative brief telling the AI exactly what vocabulary it has.
+-4. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X."*
+-5. Copy the AI's JSON, send it back to the bot (as pasted text or as a `.json` file).
+-6. Bot replies **"✅ Spec validated. Queued for render."**
+-7. In 1–3 minutes the MP4 arrives in the same chat.
++2. Pick a ratio (`16:9`).
++3. Pick a **content density** — `Compact` / `Standard` / `Rich`. This shapes the creative brief (scene + element counts), it is **not** a fixed length. The final duration is decided by the authoring AI (or an attached audio track).
++4. Pick a **style category** — one of `SaaS / UI`, `Talking Head`, `Typography`. If the category has more than one flavor, the bot then shows the flavor picker (e.g. Typography → `Editorial / typographic`, `Kinetic quote`, `Neon device demo`, `Retro poster`). `Talking Head` has a single flavor and skips straight to the template.
++5. The bot sends you `motionforge-template.json`. Open it — `meta.prompt` is a creative brief telling the AI exactly what vocabulary it has, and instructing it to fill in `meta.duration` itself (from any attached audio, or its own pacing judgement). `meta.duration` in the template is `null` on purpose.
++6. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X. Set meta.duration to match the attached audio."*
++7. Save the AI's JSON to a file and send it back to the bot **as a `.json` file attachment**. Pasted JSON text is no longer accepted — file uploads only.
++8. Bot replies **"✅ Spec validated. Queued for render."**
++9. In 1–3 minutes the MP4 arrives in the same chat.
+ 
+ If validation fails, the bot returns the exact error messages from `worker/src/validate.js` — same wording (including *"did you mean…"* suggestions) as `js/validate.js` uses in the studio. Fix and resend.
+ 
+diff --git a/worker/src/telegram.js b/worker/src/telegram.js
+index 5922e2e..4725467 100644
+--- a/worker/src/telegram.js
++++ b/worker/src/telegram.js
+@@ -8,7 +8,9 @@
+    ============================================================ */
+ 
+ import { validate } from "./validate.js";
+-import { buildTemplate, STYLES } from "./template.js";
++import {
++  buildTemplate, STYLES, STYLE_CATEGORIES, flavorsFor, DENSITIES,
++} from "./template.js";
+ 
+ const TG_API = (token, method) => `https://api.telegram.org/bot${token}/${method}`;
+ 
+@@ -26,7 +28,6 @@ async function tg(env, method, body) {
+ }
+ 
+ const RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
+-const DURATIONS = [5, 8, 12, 20];
+ 
+ async function getSession(env, chatId) {
+   const row = await env.DB.prepare("SELECT * FROM sessions WHERE chat_id = ?")
+@@ -37,18 +38,22 @@ async function setSession(env, chatId, patch) {
+   const now = Math.floor(Date.now() / 1000);
+   const existing = await getSession(env, chatId);
+   const merged = Object.assign({
+-    chat_id: String(chatId), step: "idle", ratio: null, duration: null, style: null,
++    chat_id: String(chatId), step: "idle", ratio: null, density: null,
++    style_category: null, style: null,
+     created_at: now,
+   }, existing || {}, patch, { updated_at: now });
+   await env.DB.prepare(
+-    `INSERT INTO sessions (chat_id, step, ratio, duration, style, created_at, updated_at)
+-     VALUES (?, ?, ?, ?, ?, ?, ?)
++    `INSERT INTO sessions
++       (chat_id, step, ratio, density, style_category, style, created_at, updated_at)
++     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chat_id) DO UPDATE SET
+-       step=excluded.step, ratio=excluded.ratio, duration=excluded.duration,
+-       style=excluded.style, updated_at=excluded.updated_at`
++       step=excluded.step, ratio=excluded.ratio, density=excluded.density,
++       style_category=excluded.style_category, style=excluded.style,
++       updated_at=excluded.updated_at`
+   ).bind(
+-    merged.chat_id, merged.step, merged.ratio,
+-    merged.duration, merged.style, merged.created_at, merged.updated_at
++    merged.chat_id, merged.step, merged.ratio, merged.density,
++    merged.style_category, merged.style,
++    merged.created_at, merged.updated_at
+   ).run();
+   return merged;
+ }
+@@ -63,13 +68,50 @@ const kbRatio = () => ({
+     RATIOS.slice(3).map(r => ({ text: r, callback_data: "ratio:" + r })),
+   ],
+ });
+-const kbDuration = () => ({
+-  inline_keyboard: [DURATIONS.map(d => ({ text: `${d}s`, callback_data: "dur:" + d }))],
++const kbDensity = () => ({
++  inline_keyboard: [
++    DENSITIES.map(d => ({ text: d.label, callback_data: "density:" + d.key })),
++  ],
++});
++const kbStyleCategory = () => ({
++  inline_keyboard: STYLE_CATEGORIES.map(c => [
++    { text: c.label, callback_data: "cat:" + c.key },
++  ]),
+ });
+-const kbStyle = () => ({
+-  inline_keyboard: STYLES.map(s => [{ text: s.label, callback_data: "style:" + s.key }]),
++const kbStyleFlavor = (categoryKey) => ({
++  inline_keyboard: flavorsFor(categoryKey).map(s => [
++    { text: s.label, callback_data: "style:" + s.key },
++  ]),
+ });
+ 
++const DENSITY_PROMPT =
++  "How much content? (this shapes the brief, not a fixed length)\n\n" +
++  DENSITIES.map(d => `• *${d.label}* — ${d.hint}`).join("\n");
++
++async function proceedToTemplate(env, chatId, style) {
++  const s = STYLES.find(x => x.key === style);
++  if (!s) return;
++  const sess = await setSession(env, chatId, { step: "await_spec", style });
++  const tmpl = buildTemplate({
++    ratio: sess.ratio,
++    style,
++    density: sess.density,
++  });
++  const json = JSON.stringify(tmpl, null, 2);
++  const blob = new Blob([json], { type: "application/json" });
++  const fd = new FormData();
++  fd.append("chat_id", String(chatId));
++  fd.append("caption",
++    `Style: *${s.label}* ✓\n\nTake this template + the creative brief inside \`meta.prompt\` ` +
++    `to any AI (ChatGPT/Claude/Gemini). Ask it to fill in the *scenes* array. ` +
++    `Send the completed JSON back here as a \`.json\` file attachment.\n\n` +
++    `You can also attach a voiceover or reference audio in your prompt to that AI ` +
++    `— MotionForge itself doesn't need audio, it just renders the JSON.`);
++  fd.append("parse_mode", "Markdown");
++  fd.append("document", blob, "motionforge-template.json");
++  await fetch(TG_API(env.TELEGRAM_BOT_TOKEN, "sendDocument"), { method: "POST", body: fd });
++}
++
+ /* ---------- main webhook handler ---------- */
+ export async function handleTelegramUpdate(env, update, deps) {
+   // Callback-query press on an inline keyboard
+@@ -84,47 +126,56 @@ export async function handleTelegramUpdate(env, update, deps) {
+     if (data.startsWith("ratio:")) {
+       const r = data.slice(6);
+       if (!RATIOS.includes(r)) return;
+-      await setSession(env, chatId, { step: "await_duration", ratio: r });
++      await setSession(env, chatId, { step: "await_density", ratio: r });
+       return tg(env, "sendMessage", {
+         chat_id: chatId,
+-        text: `Ratio: *${r}* ✓\n\nDuration (seconds):`,
++        text: `Ratio: *${r}* ✓\n\n${DENSITY_PROMPT}`,
+         parse_mode: "Markdown",
+-        reply_markup: kbDuration(),
++        reply_markup: kbDensity(),
+       });
+     }
+-    if (data.startsWith("dur:")) {
+-      const d = parseInt(data.slice(4), 10);
+-      if (!Number.isFinite(d) || d <= 0 || d > 120) return;
+-      await setSession(env, chatId, { step: "await_style", duration: d });
++    if (data.startsWith("density:")) {
++      const key = data.slice(8);
++      const d = DENSITIES.find(x => x.key === key);
++      if (!d) return;
++      await setSession(env, chatId, { step: "await_style_category", density: key });
+       return tg(env, "sendMessage", {
+         chat_id: chatId,
+-        text: `Duration: *${d}s* ✓\n\nPick a style — this is just a starting flavor, the AI is free within the whole preset library:`,
++        text:
++          `Density: *${d.label}* ✓\n\n` +
++          `Pick a style category — this is just a starting flavor, the AI is free within ` +
++          `the whole preset library:`,
+         parse_mode: "Markdown",
+-        reply_markup: kbStyle(),
++        reply_markup: kbStyleCategory(),
++      });
++    }
++    if (data.startsWith("cat:")) {
++      const key = data.slice(4);
++      const cat = STYLE_CATEGORIES.find(c => c.key === key);
++      if (!cat) return;
++      const flavors = flavorsFor(key);
++      if (flavors.length === 0) return;
++      // If a category has only one flavor, skip the flavor sub-step.
++      if (flavors.length === 1) {
++        await setSession(env, chatId, { step: "await_spec", style_category: key });
++        await tg(env, "sendMessage", {
++          chat_id: chatId,
++          text: `Category: *${cat.label}* ✓`,
++          parse_mode: "Markdown",
++        });
++        return proceedToTemplate(env, chatId, flavors[0].key);
++      }
++      await setSession(env, chatId, { step: "await_style", style_category: key });
++      return tg(env, "sendMessage", {
++        chat_id: chatId,
++        text: `Category: *${cat.label}* ✓\n\nPick a flavor:`,
++        parse_mode: "Markdown",
++        reply_markup: kbStyleFlavor(key),
+       });
+     }
+     if (data.startsWith("style:")) {
+       const key = data.slice(6);
+-      const s = STYLES.find(x => x.key === key);
+-      if (!s) return;
+-      const sess = await setSession(env, chatId, { step: "await_spec", style: key });
+-      const tmpl = buildTemplate({ ratio: sess.ratio, duration: sess.duration, style: key });
+-      // Send template as a document — Telegram truncates long messages,
+-      // and 5+KB of JSON as text is unreadable anyway.
+-      const json = JSON.stringify(tmpl, null, 2);
+-      const blob = new Blob([json], { type: "application/json" });
+-      const fd = new FormData();
+-      fd.append("chat_id", String(chatId));
+-      fd.append("caption",
+-        `Style: *${s.label}* ✓\n\nTake this template + the creative brief inside \`meta.prompt\` ` +
+-        `to any AI (ChatGPT/Claude/Gemini). Ask it to fill in the *scenes* array. ` +
+-        `Send the completed JSON back here — as a file or pasted text.\n\n` +
+-        `You can also attach a voiceover or reference audio in your prompt to that AI ` +
+-        `— MotionForge itself doesn't need audio, it just renders the JSON.`);
+-      fd.append("parse_mode", "Markdown");
+-      fd.append("document", blob, "motionforge-template.json");
+-      await fetch(TG_API(env.TELEGRAM_BOT_TOKEN, "sendDocument"), { method: "POST", body: fd });
+-      return;
++      return proceedToTemplate(env, chatId, key);
+     }
+     return;
+   }
+@@ -139,10 +190,15 @@ export async function handleTelegramUpdate(env, update, deps) {
+ 
+   /* --- commands --- */
+   if (text === "/start" || text === "/new" || text === "/help") {
+-    await setSession(env, chatId, { step: "await_ratio", ratio: null, duration: null, style: null });
++    await setSession(env, chatId, {
++      step: "await_ratio",
++      ratio: null, density: null, style_category: null, style: null,
++    });
+     const help = text === "/help"
+       ? "MotionForge — turn a Motion JSON Studio spec into an MP4 via Telegram.\n\n" +
+-        "Flow:\n1. /new → pick ratio, duration, style\n2. Get a JSON template\n3. Fill it (with any AI)\n4. Send it back → I render + return the MP4\n\n" +
++        "Flow:\n1. /new → pick ratio, content density, style (category → flavor)\n" +
++        "2. Get a JSON template\n3. Fill it (with any AI)\n" +
++        "4. Send it back as a .json file → I render + return the MP4\n\n" +
+         "Commands: /new /status /cancel /help\n"
+       : "👋 MotionForge. I turn a Motion JSON Studio spec into an MP4.\n\nPick an aspect ratio:";
+     return tg(env, "sendMessage", {
+@@ -163,9 +219,8 @@ export async function handleTelegramUpdate(env, update, deps) {
+     return tg(env, "sendMessage", { chat_id: chatId, text: line, parse_mode: "Markdown" });
+   }
+ 
+-  /* --- incoming spec (as document or pasted text) --- */
++  /* --- incoming spec (as .json document only) --- */
+   const sess = await getSession(env, chatId);
+-  const looksLikeJson = text.startsWith("{") && text.endsWith("}");
+   let specText = null;
+ 
+   if (msg.document) {
+@@ -184,8 +239,6 @@ export async function handleTelegramUpdate(env, update, deps) {
+     } catch (err) {
+       return tg(env, "sendMessage", { chat_id: chatId, text: "Could not download that file: " + (err.message || err) });
+     }
+-  } else if (looksLikeJson) {
+-    specText = text;
+   }
+ 
+   if (specText) {
+@@ -198,12 +251,23 @@ export async function handleTelegramUpdate(env, update, deps) {
+   }
+   if (sess.step === "await_ratio")
+     return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a ratio:", reply_markup: kbRatio() });
+-  if (sess.step === "await_duration")
+-    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a duration:", reply_markup: kbDuration() });
++  if (sess.step === "await_density")
++    return tg(env, "sendMessage", {
++      chat_id: chatId, text: DENSITY_PROMPT, parse_mode: "Markdown", reply_markup: kbDensity(),
++    });
++  if (sess.step === "await_style_category")
++    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a style category:", reply_markup: kbStyleCategory() });
+   if (sess.step === "await_style")
+-    return tg(env, "sendMessage", { chat_id: chatId, text: "Pick a style:", reply_markup: kbStyle() });
++    return tg(env, "sendMessage", {
++      chat_id: chatId, text: "Pick a flavor:",
++      reply_markup: kbStyleFlavor(sess.style_category),
++    });
+   if (sess.step === "await_spec")
+-    return tg(env, "sendMessage", { chat_id: chatId, text: "Send me the completed JSON — as a .json file or pasted text." });
++    return tg(env, "sendMessage", {
++      chat_id: chatId,
++      text: "Please send the completed spec as a `.json` file attachment — pasted JSON text is no longer accepted.",
++      parse_mode: "Markdown",
++    });
+ }
+ 
+ /* ---------- validate + queue a job ---------- */
+diff --git a/worker/src/template.js b/worker/src/template.js
+index 34ed314..31a33b4 100644
+--- a/worker/src/template.js
++++ b/worker/src/template.js
+@@ -17,33 +17,67 @@ import {
+   BACKGROUNDS, TRANSITIONS, FONT_NAMES, SIZES, RATIOS,
+ } from "./validate.js";
+ 
+-/** Style categories are grouped from the actual preset library
+- *  (js/presets.js), not invented. Users pick one; the AI is
+- *  free within the whole preset vocabulary regardless. */
++/** Style flavors are grouped from the actual preset library
++ *  (js/presets.js), not invented. Users pick one of 3 major
++ *  categories, then (if the category has multiple flavors) a
++ *  specific flavor; the AI is free within the whole preset
++ *  vocabulary regardless. */
+ export const STYLES = [
+-  { key: "editorial",    label: "Editorial / typographic",    hint: "Big serif+grotesk type, char-cascade titles, generous negative space, single accent color." },
+-  { key: "ui-compare",   label: "UI / SaaS compare",          hint: "Dashed option cards, checkmark/cross markers, a cursor that clicks the winning option." },
+-  { key: "data-story",   label: "Data story",                 hint: "Counter, bar-chart or sparkline, a caption chip and a title — numbers grow in with outBack." },
+-  { key: "kinetic-quote",label: "Kinetic quote",              hint: "Word-cascade + word-mask over a bold gradient background; camera slowly zooms." },
+-  { key: "neon-device",  label: "Neon device demo",           hint: "A device frame containing a UI clip, glow shadows, elastic-pop labels, glitch entrance on the hero word." },
+-  { key: "retro-poster", label: "Retro poster",               hint: "Paper background, uppercase display font, stripes + big number, mask-up + wipe-reveal reveals." },
+-  { key: "3d-deck",      label: "3D card deck",               hint: "Three tilted cards flipping in with flip-x / flip-y, a caption chip, subtle drift idles." },
+-  { key: "talking-head", label: "Talking head lower-third",   hint: "Avatar-placeholder, name text, caption chip, subtle float idle; a sparkline audio waveform." },
+-  { key: "mixed",        label: "Mixed 3-act",                hint: "Three sequential scenes: hook → data → CTA. Each scene 3–5 elements, cross-fade transitions." },
++  { key: "ui-compare",   category: "saas-ui",      label: "UI / SaaS compare",          hint: "Dashed option cards, checkmark/cross markers, a cursor that clicks the winning option." },
++  { key: "data-story",   category: "saas-ui",      label: "Data story",                 hint: "Counter, bar-chart or sparkline, a caption chip and a title — numbers grow in with outBack." },
++  { key: "3d-deck",      category: "saas-ui",      label: "3D card deck",               hint: "Three tilted cards flipping in with flip-x / flip-y, a caption chip, subtle drift idles." },
++  { key: "talking-head", category: "talking-head", label: "Talking head lower-third",   hint: "Avatar-placeholder, name text, caption chip, subtle float idle; a sparkline audio waveform." },
++  { key: "editorial",    category: "typography",   label: "Editorial / typographic",    hint: "Big serif+grotesk type, char-cascade titles, generous negative space, single accent color." },
++  { key: "kinetic-quote",category: "typography",   label: "Kinetic quote",              hint: "Word-cascade + word-mask over a bold gradient background; camera slowly zooms." },
++  { key: "neon-device",  category: "typography",   label: "Neon device demo",           hint: "A device frame containing a UI clip, glow shadows, elastic-pop labels, glitch entrance on the hero word." },
++  { key: "retro-poster", category: "typography",   label: "Retro poster",               hint: "Paper background, uppercase display font, stripes + big number, mask-up + wipe-reveal reveals." },
+ ];
+ 
+-const CREATIVE_BRIEF = (durationSec, ratio, styleHint) => `
++/** Major categories shown as the first-level style picker.
++ *  Order here is the order rendered as inline-keyboard buttons. */
++export const STYLE_CATEGORIES = [
++  { key: "saas-ui",      label: "SaaS / UI" },
++  { key: "talking-head", label: "Talking Head" },
++  { key: "typography",   label: "Typography" },
++];
++
++/** Flavors belonging to a category, preserving STYLES order. */
++export function flavorsFor(categoryKey) {
++  return STYLES.filter(s => s.category === categoryKey);
++}
++
++/** Density tiers — a scene/element-count guidance the user picks
++ *  instead of a hard duration. The authoring AI decides the actual
++ *  duration itself (or takes it from an attached audio track). */
++export const DENSITIES = [
++  { key: "compact",  label: "Compact",  scenes: "1–2", elements: "3–5",
++    hint: "Short and focused — 1–2 scenes, 3–5 elements per scene." },
++  { key: "standard", label: "Standard", scenes: "2–3", elements: "4–6",
++    hint: "Balanced pacing — 2–3 scenes, 4–6 elements per scene." },
++  { key: "rich",     label: "Rich",     scenes: "3–5", elements: "5–8",
++    hint: "Dense and layered — 3–5 scenes, 5–8 elements per scene." },
++];
++
++const CREATIVE_BRIEF = (ratio, styleHint, density) => `
+ You are filling in a Motion JSON Studio spec that a headless renderer
+ will turn into an MP4. Fill in the "scenes" array (and refine palette
+ if you want) to match the user's request. Rules:
+ 
+-- Split the total duration (${durationSec}s, ${ratio}) into 1–4 scenes
+-  that fully cover [0, ${durationSec}]. Adjacent scenes should touch
+-  (scene[i].end === scene[i+1].start) unless you deliberately want a
+-  crossfade (overlap slightly) or a hard cut (transition:"cut").
+-- Every scene must have 3–8 elements. Layer them with real staggering
+-  — set explicit "start" values or rely on scene.stagger. Never leave
+-  a scene visually empty for more than ~0.4s.
++- Determine total duration yourself based on the attached audio length
++  (if any) or your own judgment of appropriate pacing for this content
++  — set meta.duration accordingly in your output. If no audio is
++  provided, default to roughly 8–15 seconds unless the content clearly
++  calls for more.
++- Canvas ratio is ${ratio}. Split the total duration into ${density.scenes}
++  scenes that fully cover [0, meta.duration]. Adjacent scenes should
++  touch (scene[i].end === scene[i+1].start) unless you deliberately
++  want a crossfade (overlap slightly) or a hard cut (transition:"cut").
++- Every scene must have ${density.elements} elements. Layer them with
++  real staggering — set explicit "start" values or rely on
++  scene.stagger. Never leave a scene visually empty for more than ~0.4s.
++- You are free to structure the piece as a multi-act sequence
++  (e.g. hook → data → CTA) whenever the content benefits from it,
++  regardless of the chosen style flavor.
+ - Use the preset vocabulary CONFIDENTLY. Types: ${TYPES.join(", ")}.
+   Entrances: ${ENTRANCE_NAMES.join(", ")}.
+   Idles: ${IDLE_NAMES.join(", ")}.
+@@ -65,17 +99,23 @@ if you want) to match the user's request. Rules:
+ `.trim();
+ 
+ /**
+- * Build a starter spec for the given ratio/duration/style.
++ * Build a starter spec for the given ratio/style/density.
+  * The spec is deliberately minimal (one scene, one placeholder text)
+  * so it validates as-is, and so an AI filling it in has a clean slate.
++ *
++ * meta.duration is intentionally null in the *template* — the
++ * authoring AI is expected to fill in a real number (from the audio
++ * length or its own pacing judgement) before sending the spec back
++ * for the render job. The server-side validator accepts null here
++ * but requires a positive number on the returned spec.
+  */
+-export function buildTemplate({ ratio, duration, style }) {
++export function buildTemplate({ ratio, style, density }) {
+   const R = RATIOS[ratio] ? ratio : "16:9";
+   const [W, H] = RATIOS[R];
+-  const dur = Number.isFinite(+duration) && +duration > 0 ? +duration : 8;
+   const styleDef = STYLES.find(s => s.key === style) || STYLES[0];
++  const densityDef = DENSITIES.find(d => d.key === density) || DENSITIES[1];
+ 
+-  const brief = CREATIVE_BRIEF(dur, R, `${styleDef.label} — ${styleDef.hint}`);
++  const brief = CREATIVE_BRIEF(R, `${styleDef.label} — ${styleDef.hint}`, densityDef);
+ 
+   return {
+     meta: {
+@@ -85,7 +125,7 @@ export function buildTemplate({ ratio, duration, style }) {
+       ratio: R,
+       width: W,
+       height: H,
+-      duration: dur,
++      duration: null,
+       fps: 30,
+       font: "grotesk",
+     },
+@@ -101,7 +141,7 @@ export function buildTemplate({ ratio, duration, style }) {
+       {
+         id: "scene-1",
+         start: 0,
+-        end: dur,
++        end: 8,
+         background: "gradient-radial",
+         transition: "fade",
+         elements: [
+diff --git a/worker/src/validate.js b/worker/src/validate.js
+index a81947a..6858f01 100644
+--- a/worker/src/validate.js
++++ b/worker/src/validate.js
+@@ -118,7 +118,12 @@ export function validate(spec) {
+   if (!spec.meta || typeof spec.meta !== "object") errors.push('Missing "meta" object.');
+   else {
+     const m = spec.meta;
+-    if (!isNum(m.duration) || m.duration <= 0) errors.push('"meta.duration" must be a positive number (seconds).');
++    // meta.duration may be null in a freshly-generated *template* (the authoring
++    // AI is expected to fill it in). If present, it must be a positive number.
++    if (m.duration != null) {
++      if (!isNum(m.duration) || m.duration <= 0)
++        errors.push('"meta.duration" must be a positive number (seconds), or null in an unfilled template.');
++    }
+     const hasWH = isNum(m.width) && isNum(m.height) && m.width > 0 && m.height > 0;
+     if (!hasWH) {
+       if (RATIOS[m.ratio]) warnings.push(`meta.width/height missing — derived from ratio "${m.ratio}".`);
+@@ -154,7 +159,7 @@ export function validate(spec) {
+       if (prevEnd != null && sc.start > prevEnd + 0.001) warnings.push(`${tag}: starts ${(sc.start - prevEnd).toFixed(2)}s after the previous scene ends — the canvas will be empty in that gap.`);
+       if (prevEnd != null && sc.start < prevEnd - 0.001) warnings.push(`${tag}: overlaps the previous scene by ${(prevEnd - sc.start).toFixed(2)}s — they will cross-fade.`);
+       prevEnd = sc.end;
+-      if (spec.meta && isNum(spec.meta.duration) && sc.end > spec.meta.duration + 0.001)
++      if (spec.meta && spec.meta.duration != null && isNum(spec.meta.duration) && sc.end > spec.meta.duration + 0.001)
+         warnings.push(`${tag}: ends at ${sc.end}s, past meta.duration (${spec.meta.duration}s) — it will be cut off.`);
+     }
+     if (sc.background != null && !BACKGROUNDS.includes(sc.background))
