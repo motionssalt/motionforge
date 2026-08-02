@@ -118,7 +118,12 @@ export function validate(spec) {
   if (!spec.meta || typeof spec.meta !== "object") errors.push('Missing "meta" object.');
   else {
     const m = spec.meta;
-    if (!isNum(m.duration) || m.duration <= 0) errors.push('"meta.duration" must be a positive number (seconds).');
+    // meta.duration may be null in a freshly-generated *template* (the authoring
+    // AI is expected to fill it in). If present, it must be a positive number.
+    if (m.duration != null) {
+      if (!isNum(m.duration) || m.duration <= 0)
+        errors.push('"meta.duration" must be a positive number (seconds), or null in an unfilled template.');
+    }
     const hasWH = isNum(m.width) && isNum(m.height) && m.width > 0 && m.height > 0;
     if (!hasWH) {
       if (RATIOS[m.ratio]) warnings.push(`meta.width/height missing — derived from ratio "${m.ratio}".`);
@@ -154,7 +159,7 @@ export function validate(spec) {
       if (prevEnd != null && sc.start > prevEnd + 0.001) warnings.push(`${tag}: starts ${(sc.start - prevEnd).toFixed(2)}s after the previous scene ends — the canvas will be empty in that gap.`);
       if (prevEnd != null && sc.start < prevEnd - 0.001) warnings.push(`${tag}: overlaps the previous scene by ${(prevEnd - sc.start).toFixed(2)}s — they will cross-fade.`);
       prevEnd = sc.end;
-      if (spec.meta && isNum(spec.meta.duration) && sc.end > spec.meta.duration + 0.001)
+      if (spec.meta && spec.meta.duration != null && isNum(spec.meta.duration) && sc.end > spec.meta.duration + 0.001)
         warnings.push(`${tag}: ends at ${sc.end}s, past meta.duration (${spec.meta.duration}s) — it will be cut off.`);
     }
     if (sc.background != null && !BACKGROUNDS.includes(sc.background))
