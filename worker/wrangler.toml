@@ -1,0 +1,31 @@
+# ============================================================
+# MotionForge Worker — Cloudflare configuration
+# ------------------------------------------------------------
+# One-time bootstrap: run .github/workflows/bootstrap.yml, then
+# copy the printed `database_id` into the [[d1_databases]] block
+# below and commit. Everything else deploys via deploy.yml.
+# ============================================================
+name = "motionforge"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "motionforge"
+# Fill this in AFTER running bootstrap.yml (see README):
+database_id   = "REPLACE_WITH_BOOTSTRAP_OUTPUT"
+
+# GitHub repo hosting render.yml — set to your fork.
+# These are NON-SECRET (they show up in logs anyway).
+[vars]
+GH_OWNER = "REPLACE_WITH_YOUR_GH_USERNAME"
+GH_REPO  = "motionforge"
+GH_REF   = "main"
+
+# --- Secrets (never put in this file — set via `wrangler secret put`
+#     or the deploy workflow, or the Cloudflare dashboard):
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_WEBHOOK_SECRET
+#   RENDER_WEBHOOK_SECRET
+#   GH_DISPATCH_TOKEN
