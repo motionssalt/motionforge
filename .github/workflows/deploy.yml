@@ -31,12 +31,11 @@ jobs:
           CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # Migrations live at ../migrations (repo root); wrangler picks them
-          # up via `migrations_dir` on the CLI.
+          # migrations_dir is set in wrangler.toml (points to ../migrations),
+          # so no CLI flag is needed here — wrangler reads it from config.
           wrangler d1 migrations apply motionforge \
             --remote \
-            --config wrangler.toml \
-            $( [ -d ../migrations ] && echo "--migrations-dir ../migrations" )
+            --config wrangler.toml
       - name: Deploy worker
         working-directory: worker
         env:
