@@ -46,7 +46,8 @@ No R2, no S3, no external storage. The MP4 exists only on the ephemeral runner a
 │   ├── wrangler.toml
 │   └── package.json
 ├── migrations/
-│   └── 0001_init.sql         # jobs + sessions tables
+│   ├── 0001_init.sql         # jobs + sessions tables
+│   └── 0002_sessions_density.sql  # sessions: duration → density + style_category
 └── .github/workflows/
     ├── bootstrap.yml         # one-time D1 create (workflow_dispatch)
     ├── deploy.yml            # push-to-main → migrate + deploy
@@ -171,12 +172,14 @@ You never run `wrangler` yourself.
 ## End-to-end test
 
 1. In Telegram, open your bot → `/start`.
-2. Pick a ratio (`16:9`), a duration (`8s`), a style (`Editorial / typographic`).
-3. The bot sends you `motionforge-template.json`. Open it — `meta.prompt` is a creative brief telling the AI exactly what vocabulary it has.
-4. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X."*
-5. Copy the AI's JSON, send it back to the bot (as pasted text or as a `.json` file).
-6. Bot replies **"✅ Spec validated. Queued for render."**
-7. In 1–3 minutes the MP4 arrives in the same chat.
+2. Pick a ratio (`16:9`).
+3. Pick a **content density** — `Compact` / `Standard` / `Rich`. This shapes the creative brief (scene + element counts), it is **not** a fixed length. The final duration is decided by the authoring AI (or an attached audio track).
+4. Pick a **style category** — one of `SaaS / UI`, `Talking Head`, `Typography`. If the category has more than one flavor, the bot then shows the flavor picker (e.g. Typography → `Editorial / typographic`, `Kinetic quote`, `Neon device demo`, `Retro poster`). `Talking Head` has a single flavor and skips straight to the template.
+5. The bot sends you `motionforge-template.json`. Open it — `meta.prompt` is a creative brief telling the AI exactly what vocabulary it has, and instructing it to fill in `meta.duration` itself (from any attached audio, or its own pacing judgement). `meta.duration` in the template is `null` on purpose.
+6. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X. Set meta.duration to match the attached audio."*
+7. Save the AI's JSON to a file and send it back to the bot **as a `.json` file attachment**. Pasted JSON text is no longer accepted — file uploads only.
+8. Bot replies **"✅ Spec validated. Queued for render."**
+9. In 1–3 minutes the MP4 arrives in the same chat.
 
 If validation fails, the bot returns the exact error messages from `worker/src/validate.js` — same wording (including *"did you mean…"* suggestions) as `js/validate.js` uses in the studio. Fix and resend.
 
