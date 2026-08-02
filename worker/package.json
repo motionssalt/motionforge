@@ -1,0 +1,16 @@
+{
+  "name": "motionforge-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MotionForge Cloudflare Worker (Telegram bot + validation + Actions dispatch)",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "migrate": "wrangler d1 migrations apply motionforge --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
