@@ -11,10 +11,11 @@ compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
-binding       = "DB"
-database_name = "motionforge"
+binding        = "DB"
+database_name  = "motionforge"
 # Fill this in AFTER running bootstrap.yml (see README):
-database_id   = "99aacfe7-0a97-4697-b997-76a705e1ab00"
+database_id    = "99aacfe7-0a97-4697-b997-76a705e1ab00"
+migrations_dir = "../migrations"
 
 # GitHub repo hosting render.yml — set to your fork.
 # These are NON-SECRET (they show up in logs anyway).
