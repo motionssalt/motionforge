@@ -1,0 +1,166 @@
+# ============================================================
+# MotionForge — headless render + Telegram delivery
+# ------------------------------------------------------------
+# Triggered by the Worker via workflow_dispatch. Inputs:
+#   job_id             our internal job id (echoed to callback)
+#   spec_json          the full Motion JSON Studio spec as a string
+#   telegram_chat_id   destination chat for the MP4
+#
+# Flow:
+#   1. Install Node + Puppeteer's bundled Chrome + ffmpeg
+#   2. Write spec.json, run render/capture.js -> output.mp4
+#   3. POST the MP4 directly to Telegram sendVideo (multipart)
+#   4. Ping the Worker /api/webhook/render-complete with status
+# ============================================================
+name: render
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "MotionForge job id"
+        required: true
+      spec_json:
+        description: "Motion JSON Studio spec (JSON string)"
+        required: true
+      telegram_chat_id:
+        description: "Telegram chat id to send the MP4 to"
+        required: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install render deps (incl. Puppeteer + bundled Chrome)
+        working-directory: render
+        # Puppeteer v22 downloads a matching Chrome build into the cache
+        # dir on install. `npm ci` won't work without a lockfile, so use
+        # `npm install`. The `--no-audit --no-fund` flags keep logs quiet.
+        run: |
+          npm install --no-audit --no-fund
+          # Puppeteer's postinstall usually fetches Chrome; if for any
+          # reason it didn't (e.g. skipped), force it now.
+          if [ -z "$(ls -A ~/.cache/puppeteer 2>/dev/null)" ]; then
+            npx puppeteer browsers install chrome
+          fi
+
+      - name: Extra Chrome dependencies (safety net)
+        # Puppeteer's Chrome is a real Chromium build and needs the usual
+        # X/audio/font shared libs even in --headless=new. Ubuntu 22.04
+        # runners have most of these already; installing again is cheap.
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 libasound2 fonts-liberation \
+            fonts-noto-color-emoji fonts-noto-cjk || true
+
+      - name: Write spec.json from workflow input
+        env:
+          SPEC_JSON: ${{ inputs.spec_json }}
+        # Write via env var (not shell interpolation) so quotes/newlines
+        # in the JSON don't blow up the shell.
+        run: |
+          printf '%s' "$SPEC_JSON" > spec.json
+          echo "spec size: $(wc -c < spec.json) bytes"
+          node -e "JSON.parse(require('fs').readFileSync('spec.json','utf8')); console.log('spec parses OK')"
+
+      - name: Render MP4
+        id: render
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          node render/capture.js \
+            --spec "$GITHUB_WORKSPACE/spec.json" \
+            --out  "$GITHUB_WORKSPACE/output.mp4" 2>&1 | tee render.log
+          echo "exit=$?" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh output.mp4 || true
+
+      - name: Deliver MP4 to Telegram
+        id: deliver
+        if: steps.render.outcome == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:            ${{ inputs.telegram_chat_id }}
+          JOB_ID:             ${{ inputs.job_id }}
+        run: |
+          set -e
+          if [ ! -s output.mp4 ]; then
+            echo "output.mp4 missing or empty" ; exit 1
+          fi
+          SIZE=$(stat -c%s output.mp4)
+          echo "uploading output.mp4 ($SIZE bytes) to chat $CHAT_ID"
+          # Telegram bot uploads are capped at 50 MB per file. Short specs
+          # at 30fps stay well under that.
+          if [ "$SIZE" -gt 49000000 ]; then
+            echo "file too big for Telegram bot upload"; exit 1
+          fi
+          HTTP_CODE=$(curl -sS -o tg-response.json -w "%{http_code}" \
+            -F "chat_id=$CHAT_ID" \
+            -F "caption=MotionForge — job \`$JOB_ID\`" \
+            -F "parse_mode=Markdown" \
+            -F "supports_streaming=true" \
+            -F "video=@output.mp4;type=video/mp4;filename=motionforge-$JOB_ID.mp4" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo")
+          echo "HTTP $HTTP_CODE"
+          cat tg-response.json || true
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "sendVideo failed"; exit 1
+          fi
+
+      - name: Notify worker (success)
+        if: steps.render.outcome == 'success' && steps.deliver.outcome == 'success'
+        env:
+          RENDER_WEBHOOK_SECRET: ${{ secrets.RENDER_WEBHOOK_SECRET }}
+          WORKER_URL:            ${{ vars.WORKER_URL }}
+          JOB_ID:                ${{ inputs.job_id }}
+          CHAT_ID:               ${{ inputs.telegram_chat_id }}
+        run: |
+          curl -sS -X POST "$WORKER_URL/api/webhook/render-complete" \
+            -H "content-type: application/json" \
+            -H "x-render-webhook-secret: $RENDER_WEBHOOK_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"success\",\"telegram_chat_id\":\"$CHAT_ID\"}"
+
+      - name: Notify worker (failure)
+        if: steps.render.outcome != 'success' || steps.deliver.outcome != 'success'
+        env:
+          RENDER_WEBHOOK_SECRET: ${{ secrets.RENDER_WEBHOOK_SECRET }}
+          WORKER_URL:            ${{ vars.WORKER_URL }}
+          JOB_ID:                ${{ inputs.job_id }}
+          CHAT_ID:               ${{ inputs.telegram_chat_id }}
+        run: |
+          ERR="render failed"
+          if [ "${{ steps.render.outcome }}" = "success" ]; then
+            ERR="delivery to Telegram failed"
+          fi
+          if [ -f render.log ]; then
+            TAIL=$(tail -c 800 render.log | tr -d '\r' | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+            ERR="$ERR — $TAIL"
+          fi
+          curl -sS -X POST "$WORKER_URL/api/webhook/render-complete" \
+            -H "content-type: application/json" \
+            -H "x-render-webhook-secret: $RENDER_WEBHOOK_SECRET" \
+            -d "{\"job_id\":\"$JOB_ID\",\"status\":\"failed\",\"telegram_chat_id\":\"$CHAT_ID\",\"error\":\"$ERR\"}"
+
+      - name: Upload render log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-log-${{ inputs.job_id }}
+          path: |
+            render.log
+            spec.json
+          if-no-files-found: ignore
+          retention-days: 3
