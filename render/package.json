@@ -1,0 +1,13 @@
+{
+  "name": "motionforge-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Puppeteer render harness for Motion JSON Studio",
+  "main": "capture.js",
+  "scripts": {
+    "capture": "node capture.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.15.0"
+  }
+}
