@@ -14,12 +14,12 @@ compatibility_flags = ["nodejs_compat"]
 binding       = "DB"
 database_name = "motionforge"
 # Fill this in AFTER running bootstrap.yml (see README):
-database_id   = "REPLACE_WITH_BOOTSTRAP_OUTPUT"
+database_id   = "99aacfe7-0a97-4697-b997-76a705e1ab00"
 
 # GitHub repo hosting render.yml — set to your fork.
 # These are NON-SECRET (they show up in logs anyway).
 [vars]
-GH_OWNER = "REPLACE_WITH_YOUR_GH_USERNAME"
+GH_OWNER = "motionssalt"
 GH_REPO  = "motionforge"
 GH_REF   = "main"
 
