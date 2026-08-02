@@ -46,8 +46,9 @@ No R2, no S3, no external storage. The MP4 exists only on the ephemeral runner a
 │   ├── wrangler.toml
 │   └── package.json
 ├── migrations/
-│   ├── 0001_init.sql         # jobs + sessions tables
-│   └── 0002_sessions_density.sql  # sessions: duration → density + style_category
+│   ├── 0001_init.sql                     # jobs + sessions tables
+│   ├── 0002_sessions_density.sql         # sessions: duration → density + style_category
+│   └── 0003_sessions_drop_density.sql    # sessions: drop density + style — ratio only
 └── .github/workflows/
     ├── bootstrap.yml         # one-time D1 create (workflow_dispatch)
     ├── deploy.yml            # push-to-main → migrate + deploy
@@ -172,14 +173,18 @@ You never run `wrangler` yourself.
 ## End-to-end test
 
 1. In Telegram, open your bot → `/start`.
-2. Pick a ratio (`16:9`).
-3. Pick a **content density** — `Compact` / `Standard` / `Rich`. This shapes the creative brief (scene + element counts), it is **not** a fixed length. The final duration is decided by the authoring AI (or an attached audio track).
-4. Pick a **style category** — one of `SaaS / UI`, `Talking Head`, `Typography`. If the category has more than one flavor, the bot then shows the flavor picker (e.g. Typography → `Editorial / typographic`, `Kinetic quote`, `Neon device demo`, `Retro poster`). `Talking Head` has a single flavor and skips straight to the template.
-5. The bot sends you `motionforge-template.json`. Open it — `meta.prompt` is a creative brief telling the AI exactly what vocabulary it has, and instructing it to fill in `meta.duration` itself (from any attached audio, or its own pacing judgement). `meta.duration` in the template is `null` on purpose.
-6. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X. Set meta.duration to match the attached audio."*
-7. Save the AI's JSON to a file and send it back to the bot **as a `.json` file attachment**. Pasted JSON text is no longer accepted — file uploads only.
-8. Bot replies **"✅ Spec validated. Queued for render."**
-9. In 1–3 minutes the MP4 arrives in the same chat.
+2. Pick a ratio (`16:9`). **That's the only choice.** No style picker, no density picker — the authoring AI decides visual style, scene count, element density, and duration itself, based on the user's own prompt and any attached audio.
+3. The bot immediately sends you `motionforge-template.json`. Open it — `meta.prompt` is a large, self-documenting creative brief that:
+     * enumerates the full preset vocabulary (types, entrances, idles, exits, shapes, backgrounds, transitions, fonts, sizes, eases, ratios);
+     * lists exactly what fields the server-side validator requires per element type, pulled directly from `worker/src/validate.js`;
+     * lists the common validator mistakes (typoed preset names, out-of-range positions, gap/overlap warnings, missing type-specific fields) in the validator's own wording;
+     * explains how `color: "primary"` / `"accent"` / etc. resolve against the `palette` object vs. raw hex;
+     * inlines one **fully worked example scene** (adapted from the `Checklist compare` preset) showing correct field usage, staggered starts, parent-child grouping, and a camera move.
+   `meta.duration` in the template is `null` on purpose — the authoring AI fills it in from any attached audio or its own pacing judgement.
+4. Paste the whole JSON (and any voiceover/reference material) into ChatGPT / Claude / Gemini with a prompt like: *"Fill in the scenes array of this Motion JSON Studio spec — content is X. Set meta.duration to match the attached audio."*
+5. Save the AI's JSON to a file and send it back to the bot **as a `.json` file attachment**. Pasted JSON text is not accepted — file uploads only.
+6. Bot replies **"✅ Spec validated. Queued for render."**
+7. In 1–3 minutes the MP4 arrives in the same chat.
 
 If validation fails, the bot returns the exact error messages from `worker/src/validate.js` — same wording (including *"did you mean…"* suggestions) as `js/validate.js` uses in the studio. Fix and resend.
 
